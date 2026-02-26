@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.responses import JSONResponse
 import sqlite3
 import smtplib
 import secrets
@@ -11,12 +12,26 @@ from datetime import datetime
 
 app = FastAPI(title="SynthFrame API")
 
+# ── CORS — allow all origins ──
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Handle preflight OPTIONS requests explicitly
+@app.options("/{rest_of_path:path}")
+async def preflight(rest_of_path: str):
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 security = HTTPBasic()
 
@@ -70,7 +85,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
 # ── EMAIL ──
 def send_notification(lead: dict):
     if not SMTP_EMAIL or not SMTP_PASSWORD or not NOTIFY_EMAIL:
-        print("Email not configured — skipping notification")
+        print("Email not configured — skipping")
         return
     try:
         msg = MIMEMultipart("alternative")
@@ -83,11 +98,11 @@ def send_notification(lead: dict):
           <table style="width:100%;border-collapse:collapse;margin-top:16px">
             <tr><td style="padding:10px 0;color:#5c5a55;width:120px">Name</td>
                 <td style="padding:10px 0;font-weight:600">{lead['name']}</td></tr>
-            <tr style="background:#f8f7f4"><td style="padding:10px 0;color:#5c5a55">Email</td>
+            <tr><td style="padding:10px 0;color:#5c5a55">Email</td>
                 <td style="padding:10px 0">{lead['email']}</td></tr>
             <tr><td style="padding:10px 0;color:#5c5a55">Company</td>
                 <td style="padding:10px 0">{lead.get('company') or '-'}</td></tr>
-            <tr style="background:#f8f7f4"><td style="padding:10px 0;color:#5c5a55">Industry</td>
+            <tr><td style="padding:10px 0;color:#5c5a55">Industry</td>
                 <td style="padding:10px 0">{lead.get('industry') or '-'}</td></tr>
           </table>
           <div style="margin-top:24px;padding:16px;background:#f2f1ee;border-radius:12px">
@@ -101,7 +116,7 @@ def send_notification(lead: dict):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(SMTP_EMAIL, SMTP_PASSWORD)
             s.sendmail(SMTP_EMAIL, NOTIFY_EMAIL, msg.as_string())
-        print(f"Email sent for: {lead['email']}")
+        print(f"Email sent: {lead['email']}")
     except Exception as e:
         print(f"Email failed: {e}")
 
@@ -112,22 +127,31 @@ def root():
 
 @app.post("/leads", status_code=201)
 async def create_lead(request: Request, db: sqlite3.Connection = Depends(get_db)):
-    body = await request.json()
-    name  = str(body.get("name", "")).strip()
-    email = str(body.get("email", "")).strip()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    name  = str(body.get("name") or "").strip()
+    email = str(body.get("email") or "").strip()
+
     if not name or not email or "@" not in email:
         raise HTTPException(status_code=422, detail="name and valid email are required")
-    company     = str(body.get("company", "")).strip()
-    industry    = str(body.get("industry", "")).strip()
-    description = str(body.get("description", "")).strip()
-    now = datetime.utcnow().isoformat()
+
+    company     = str(body.get("company") or "").strip()
+    industry    = str(body.get("industry") or "").strip()
+    description = str(body.get("description") or "").strip()
+    now         = datetime.utcnow().isoformat()
+
     db.execute(
         "INSERT INTO leads (name, email, company, industry, description, created_at) VALUES (?,?,?,?,?,?)",
         (name, email, company, industry, description, now)
     )
     db.commit()
+
     send_notification({"name": name, "email": email, "company": company,
                        "industry": industry, "description": description})
+
     return {"message": "Lead received. We'll be in touch soon!"}
 
 @app.get("/admin/leads")
