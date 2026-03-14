@@ -132,7 +132,7 @@ async def create_lead(request: Request):
     send_notification({"name": name, "email": email, "company": company,
                        "industry": industry, "description": description})
 
-    return {"message": "Lead received. We'll be in touch soon!"}
+    return JSONResponse(status_code=201, content={"message": "Lead received!"}, headers={"Access-Control-Allow-Origin": "*"})
 
 @app.get("/admin/leads")
 async def list_leads(_=Depends(verify_admin)):
