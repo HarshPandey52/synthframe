@@ -2,17 +2,16 @@ from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import JSONResponse
-import sqlite3
 import smtplib
 import secrets
 import os
+import httpx
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 app = FastAPI(title="SynthFrame API")
 
-# ── CORS — allow all origins ──
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,54 +20,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Handle preflight OPTIONS requests explicitly
 @app.options("/{rest_of_path:path}")
 async def preflight(rest_of_path: str):
-    return JSONResponse(
-        content={},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        }
-    )
+    return JSONResponse(content={}, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    })
 
 security = HTTPBasic()
 
 # ── CONFIG ──
-SMTP_EMAIL    = os.getenv("SMTP_EMAIL", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-NOTIFY_EMAIL  = os.getenv("NOTIFY_EMAIL", "")
-ADMIN_USER    = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS    = os.getenv("ADMIN_PASS", "synthframe123")
-DB_PATH       = os.getenv("DB_PATH", "leads.db")
+SMTP_EMAIL     = os.getenv("SMTP_EMAIL", "")
+SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD", "")
+NOTIFY_EMAIL   = os.getenv("NOTIFY_EMAIL", "")
+ADMIN_USER     = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS     = os.getenv("ADMIN_PASS", "synthframe123")
+SUPABASE_URL   = os.getenv("SUPABASE_URL", "https://ofcgfpidbkttdkeosyeg.supabase.co")
+SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9mY2dmcGlkYmt0dGRrZW9zeWVnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1MDkzNDcsImV4cCI6MjA4OTA4NTM0N30.DEeNHTL4VRsIU9ZENy8ADvAyWBFvFxG8vD5kAGASqI8")
 
-# ── DATABASE ──
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)    
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS leads (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            email       TEXT NOT NULL,
-            company     TEXT,
-            industry    TEXT,
-            description TEXT,
-            created_at  TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
+SUPA_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"
+}
 
 # ── AUTH ──
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -126,28 +102,32 @@ def root():
     return {"status": "SynthFrame API is running"}
 
 @app.post("/leads", status_code=201)
-async def create_lead(request: Request, db: sqlite3.Connection = Depends(get_db)):
+async def create_lead(request: Request):
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    name  = str(body.get("name") or "").strip()
-    email = str(body.get("email") or "").strip()
+    name        = str(body.get("name") or "").strip()
+    email       = str(body.get("email") or "").strip()
+    company     = str(body.get("company") or "").strip()
+    industry    = str(body.get("industry") or "").strip()
+    description = str(body.get("description") or "").strip()
 
     if not name or not email or "@" not in email:
         raise HTTPException(status_code=422, detail="name and valid email are required")
 
-    company     = str(body.get("company") or "").strip()
-    industry    = str(body.get("industry") or "").strip()
-    description = str(body.get("description") or "").strip()
-    now         = datetime.utcnow().isoformat()
-
-    db.execute(
-        "INSERT INTO leads (name, email, company, industry, description, created_at) VALUES (?,?,?,?,?,?)",
-        (name, email, company, industry, description, now)
-    )
-    db.commit()
+    # Save to Supabase
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            f"{SUPABASE_URL}/rest/v1/leads",
+            headers=SUPA_HEADERS,
+            json={"name": name, "email": email, "company": company,
+                  "industry": industry, "description": description}
+        )
+        if res.status_code not in (200, 201):
+            print(f"Supabase error: {res.text}")
+            raise HTTPException(status_code=500, detail="Failed to save lead")
 
     send_notification({"name": name, "email": email, "company": company,
                        "industry": industry, "description": description})
@@ -155,12 +135,23 @@ async def create_lead(request: Request, db: sqlite3.Connection = Depends(get_db)
     return {"message": "Lead received. We'll be in touch soon!"}
 
 @app.get("/admin/leads")
-def list_leads(db: sqlite3.Connection = Depends(get_db), _=Depends(verify_admin)):
-    rows = db.execute("SELECT * FROM leads ORDER BY created_at DESC").fetchall()
-    return [dict(r) for r in rows]
+async def list_leads(_=Depends(verify_admin)):
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/leads?order=created_at.desc",
+            headers=SUPA_HEADERS
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to fetch leads")
+        return res.json()
 
 @app.delete("/admin/leads/{lead_id}")
-def delete_lead(lead_id: int, db: sqlite3.Connection = Depends(get_db), _=Depends(verify_admin)):
-    db.execute("DELETE FROM leads WHERE id=?", (lead_id,))
-    db.commit()
+async def delete_lead(lead_id: int, _=Depends(verify_admin)):
+    async with httpx.AsyncClient() as client:
+        res = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
+            headers=SUPA_HEADERS
+        )
+        if res.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail="Failed to delete lead")
     return {"message": "Deleted"}
